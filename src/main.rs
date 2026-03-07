@@ -1,11 +1,12 @@
-use eframe::egui;
+mod model;
+mod ui;
+mod usecase;
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions::default();
-
-    eframe::run_simple_native("Hello egui", options, |ctx, _frame| {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("Hello world");
-        });
-    })
+    eframe::run_native(
+        "Othello",
+        options,
+        Box::new(|_cc| Ok(Box::new(ui::OthelloApp::default()))),
+    )
 }
