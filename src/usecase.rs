@@ -5,6 +5,7 @@ struct MoveRecord {
     player: Cell,
     pos: Pos,
     flipped: usize,
+    note: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -54,6 +55,10 @@ impl GameController {
     }
 
     pub fn click_cell(&mut self, pos: Pos) {
+        self.apply_move_with_note(pos, None);
+    }
+
+    pub fn apply_move_with_note(&mut self, pos: Pos, note: Option<String>) {
         let mut next = self.current().clone();
         let moving_player = next.state.turn();
         let result = next.state.apply_move(pos);
@@ -68,6 +73,7 @@ impl GameController {
             player: moving_player,
             pos,
             flipped: result.flipped.len(),
+            note,
         });
 
         self.timeline.truncate(self.cursor + 1);
@@ -120,13 +126,18 @@ impl GameController {
             .iter()
             .enumerate()
             .map(|(idx, rec)| {
-                format!(
+                let base = format!(
                     "{:>2}. {:<5} {} (+{})",
                     idx + 1,
                     rec.player.name(),
                     rec.pos.notation(),
                     rec.flipped
-                )
+                );
+                if let Some(note) = &rec.note {
+                    format!("{base}  [{note}]")
+                } else {
+                    base
+                }
             })
             .collect();
 

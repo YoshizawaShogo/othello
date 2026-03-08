@@ -1,31 +1,183 @@
 use std::collections::HashSet;
+use std::sync::mpsc::{self, Receiver};
 
 use eframe::egui;
 
+use crate::cpu::{CpuMoveResult, Difficulty, OpenAiClient, TokenUsage};
 use crate::model::{BOARD_SIZE, Cell, Pos};
 use crate::usecase::{GameController, GameViewModel};
 
-const BOARD_PIXEL_SIZE: f32 = 520.0;
+const BOARD_PIXEL_SIZE: f32 = 680.0;
 const CELL_PADDING: f32 = 3.0;
 const ANIM_SECONDS: f64 = 0.24;
 const LABEL_GUTTER: f32 = 22.0;
+const DEFAULT_MODEL: &str = "gpt-5-mini";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AppScreen {
+    Start,
+    Game,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlayerKind {
+    Human,
+    Cpu,
+}
+
+impl PlayerKind {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Human => "Human",
+            Self::Cpu => "CPU",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PlayerConfig {
+    kind: PlayerKind,
+    difficulty: Difficulty,
+}
+
+impl Default for PlayerConfig {
+    fn default() -> Self {
+        Self {
+            kind: PlayerKind::Human,
+            difficulty: Difficulty::Normal,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct StartConfig {
+    api_key: String,
+    black: PlayerConfig,
+    white: PlayerConfig,
+}
+
+#[derive(Clone, Debug, Default)]
+struct UsageStats {
+    input_tokens: u64,
+    output_tokens: u64,
+    total_tokens: u64,
+    cumulative_cost_usd: f64,
+    last_call_tokens: u64,
+    last_call_cost_usd: f64,
+}
+
+impl UsageStats {
+    fn add_call(&mut self, usage: TokenUsage) {
+        self.input_tokens += usage.input_tokens;
+        self.output_tokens += usage.output_tokens;
+        self.total_tokens += usage.total_tokens;
+        self.cumulative_cost_usd += usage.estimated_cost_usd;
+        self.last_call_tokens = usage.total_tokens;
+        self.last_call_cost_usd = usage.estimated_cost_usd;
+    }
+}
 
 pub struct OthelloApp {
+    screen: AppScreen,
+    start_config: StartConfig,
     controller: GameController,
     last_anim: Option<(Pos, f64)>,
+    usage: UsageStats,
+    cpu_thinking: bool,
+    cpu_status: Option<String>,
+    cpu_rx: Option<Receiver<CpuMoveResult>>,
 }
 
 impl Default for OthelloApp {
     fn default() -> Self {
         Self {
+            screen: AppScreen::Start,
+            start_config: StartConfig::default(),
             controller: GameController::new(),
             last_anim: None,
+            usage: UsageStats::default(),
+            cpu_thinking: false,
+            cpu_status: None,
+            cpu_rx: None,
         }
     }
 }
 
 impl eframe::App for OthelloApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        match self.screen {
+            AppScreen::Start => self.update_start_screen(ctx),
+            AppScreen::Game => self.update_game_screen(ctx),
+        }
+    }
+}
+
+impl OthelloApp {
+    fn update_start_screen(&mut self, ctx: &egui::Context) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.vertical_centered(|ui| {
+                ui.add_space(24.0);
+                ui.heading("Othello - Start");
+                ui.label("Configure each side independently");
+                ui.add_space(12.0);
+            });
+
+            ui.columns(2, |cols| {
+                draw_player_config(
+                    &mut cols[0],
+                    "Player 1 (Black)",
+                    &mut self.start_config.black,
+                );
+                draw_player_config(
+                    &mut cols[1],
+                    "Player 2 (White)",
+                    &mut self.start_config.white,
+                );
+            });
+
+            ui.add_space(12.0);
+            let cpu_exists = self.has_any_cpu();
+            ui.group(|ui| {
+                ui.label("OpenAI API Key (memory only)");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.start_config.api_key)
+                        .password(true)
+                        .hint_text("sk-...")
+                        .desired_width(560.0),
+                );
+                if cpu_exists {
+                    ui.small("Required when either side is CPU.");
+                } else {
+                    ui.small("Optional when both sides are Human.");
+                }
+            });
+
+            let can_start = !cpu_exists || !self.start_config.api_key.trim().is_empty();
+            if cpu_exists && !can_start {
+                ui.colored_label(
+                    egui::Color32::from_rgb(190, 60, 60),
+                    "At least one side is CPU, so API key is required.",
+                );
+            }
+
+            ui.add_space(12.0);
+            if ui
+                .add_enabled(can_start, egui::Button::new("Start Game"))
+                .clicked()
+            {
+                self.controller.reset();
+                self.last_anim = None;
+                self.usage = UsageStats::default();
+                self.cpu_status = None;
+                self.cpu_thinking = false;
+                self.cpu_rx = None;
+                self.screen = AppScreen::Game;
+            }
+        });
+    }
+
+    fn update_game_screen(&mut self, ctx: &egui::Context) {
+        self.poll_cpu_result(ctx);
         let mut vm = self.controller.view_model();
 
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
@@ -34,9 +186,16 @@ impl eframe::App for OthelloApp {
                 ui.separator();
                 ui.label(vm.message.as_str());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Back to Start").clicked() {
+                        self.screen = AppScreen::Start;
+                    }
                     if ui.button("Reset").clicked() {
                         self.controller.reset();
                         self.last_anim = None;
+                        self.cpu_thinking = false;
+                        self.cpu_status = None;
+                        self.cpu_rx = None;
+                        self.usage = UsageStats::default();
                         vm = self.controller.view_model();
                     }
                 });
@@ -44,7 +203,7 @@ impl eframe::App for OthelloApp {
         });
 
         egui::SidePanel::right("side_panel")
-            .min_width(220.0)
+            .min_width(320.0)
             .show(ctx, |ui| {
                 draw_turn_badge(ui, vm.turn);
                 ui.add_space(8.0);
@@ -66,6 +225,39 @@ impl eframe::App for OthelloApp {
                         vm = self.controller.view_model();
                     }
                 });
+
+                ui.add_space(12.0);
+                ui.heading("Players");
+                draw_player_summary(ui, Cell::Black, &self.start_config.black);
+                draw_player_summary(ui, Cell::White, &self.start_config.white);
+
+                ui.add_space(8.0);
+                ui.heading("CPU Status");
+                if self.cpu_thinking {
+                    ui.colored_label(egui::Color32::from_rgb(40, 120, 200), "Thinking...");
+                } else {
+                    ui.label("Idle");
+                }
+                if let Some(status) = &self.cpu_status {
+                    ui.small(status);
+                }
+
+                ui.add_space(12.0);
+                ui.heading("Token / Cost");
+                ui.monospace(format!("Last call tokens: {}", self.usage.last_call_tokens));
+                ui.monospace(format!(
+                    "Last call cost: ${:.6}",
+                    self.usage.last_call_cost_usd
+                ));
+                ui.separator();
+                ui.monospace(format!("Input tokens: {}", self.usage.input_tokens));
+                ui.monospace(format!("Output tokens: {}", self.usage.output_tokens));
+                ui.monospace(format!("Total tokens: {}", self.usage.total_tokens));
+                ui.monospace(format!(
+                    "Total cost: ${:.6}",
+                    self.usage.cumulative_cost_usd
+                ));
+
                 ui.add_space(10.0);
                 ui.heading("History");
                 egui::ScrollArea::vertical()
@@ -84,7 +276,8 @@ impl eframe::App for OthelloApp {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.vertical_centered(|ui| {
-                let clicked = draw_board(ui, ctx, &vm, self.last_anim);
+                let clickable = !vm.game_over && !self.cpu_thinking && self.is_human_turn(vm.turn);
+                let clicked = draw_board(ui, ctx, &vm, self.last_anim, clickable);
                 if let Some(pos) = clicked {
                     let before = vm.last_move;
                     self.controller.click_cell(pos);
@@ -114,6 +307,10 @@ impl eframe::App for OthelloApp {
                     if ui.button("Play Again").clicked() {
                         self.controller.reset();
                         self.last_anim = None;
+                        self.cpu_status = None;
+                        self.cpu_thinking = false;
+                        self.cpu_rx = None;
+                        self.usage = UsageStats::default();
                     }
                 });
         }
@@ -126,6 +323,145 @@ impl eframe::App for OthelloApp {
                 self.last_anim = None;
             }
         }
+
+        self.maybe_schedule_cpu(&vm);
+        if self.cpu_thinking {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
+    }
+
+    fn has_any_cpu(&self) -> bool {
+        self.start_config.black.kind == PlayerKind::Cpu
+            || self.start_config.white.kind == PlayerKind::Cpu
+    }
+
+    fn player_config_for(&self, turn: Cell) -> &PlayerConfig {
+        match turn {
+            Cell::Black => &self.start_config.black,
+            Cell::White => &self.start_config.white,
+            Cell::Empty => &self.start_config.black,
+        }
+    }
+
+    fn is_human_turn(&self, turn: Cell) -> bool {
+        self.player_config_for(turn).kind == PlayerKind::Human
+    }
+
+    fn maybe_schedule_cpu(&mut self, vm: &GameViewModel) {
+        if vm.game_over
+            || self.cpu_thinking
+            || vm.legal_moves.is_empty()
+            || self.is_human_turn(vm.turn)
+        {
+            return;
+        }
+
+        self.cpu_thinking = true;
+        self.cpu_status = Some(format!(
+            "{} CPU: calling OpenAI Responses API...",
+            vm.turn.name()
+        ));
+
+        let board = vm.board;
+        let turn = vm.turn;
+        let legal_moves = vm.legal_moves.clone();
+        let difficulty = self.player_config_for(turn).difficulty;
+        let api_key = self.start_config.api_key.clone();
+        let (tx, rx) = mpsc::channel();
+        self.cpu_rx = Some(rx);
+
+        std::thread::spawn(move || {
+            let result = match OpenAiClient::new(api_key, DEFAULT_MODEL.to_string()) {
+                Ok(client) => client.choose_move(&board, turn, &legal_moves, difficulty),
+                Err(err) => CpuMoveResult {
+                    pos: *legal_moves.first().unwrap_or(&Pos::new(0, 0)),
+                    usage: None,
+                    fallback_used: true,
+                    note: Some(format!("CPU fallback move used: {err}")),
+                },
+            };
+            let _ = tx.send(result);
+        });
+    }
+
+    fn poll_cpu_result(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.cpu_rx else {
+            return;
+        };
+        let Ok(result) = rx.try_recv() else {
+            return;
+        };
+
+        self.cpu_rx = None;
+        self.cpu_thinking = false;
+
+        if let Some(usage) = result.usage {
+            self.usage.add_call(usage);
+        }
+
+        let turn = self.controller.view_model().turn;
+        let note = if result.fallback_used {
+            result.note.clone()
+        } else {
+            None
+        };
+        if let Some(text) = &result.note {
+            self.cpu_status = Some(format!("{} CPU: {text}", turn.name()));
+        } else {
+            self.cpu_status = Some(format!(
+                "{} CPU played {}",
+                turn.name(),
+                result.pos.notation()
+            ));
+        }
+
+        let before = self.controller.view_model().last_move;
+        self.controller.apply_move_with_note(result.pos, note);
+        let after = self.controller.view_model();
+        if after.last_move != before
+            && let Some(last_move) = after.last_move
+        {
+            self.last_anim = Some((last_move, ctx.input(|i| i.time)));
+        }
+    }
+}
+
+fn draw_player_config(ui: &mut egui::Ui, title: &str, config: &mut PlayerConfig) {
+    ui.group(|ui| {
+        ui.heading(title);
+        ui.add_space(6.0);
+        ui.label("Type");
+        ui.horizontal(|ui| {
+            ui.selectable_value(
+                &mut config.kind,
+                PlayerKind::Human,
+                PlayerKind::Human.name(),
+            );
+            ui.selectable_value(&mut config.kind, PlayerKind::Cpu, PlayerKind::Cpu.name());
+        });
+
+        ui.add_space(8.0);
+        ui.add_enabled_ui(config.kind == PlayerKind::Cpu, |ui| {
+            ui.label("CPU Difficulty");
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut config.difficulty, Difficulty::Easy, "Easy");
+                ui.selectable_value(&mut config.difficulty, Difficulty::Normal, "Normal");
+                ui.selectable_value(&mut config.difficulty, Difficulty::Hard, "Hard");
+            });
+        });
+    });
+}
+
+fn draw_player_summary(ui: &mut egui::Ui, side: Cell, config: &PlayerConfig) {
+    let side_name = match side {
+        Cell::Black => "Black",
+        Cell::White => "White",
+        Cell::Empty => "-",
+    };
+    if config.kind == PlayerKind::Cpu {
+        ui.label(format!("{side_name}: CPU ({})", config.difficulty.name()));
+    } else {
+        ui.label(format!("{side_name}: Human"));
     }
 }
 
@@ -178,13 +514,18 @@ fn draw_board(
     ctx: &egui::Context,
     vm: &GameViewModel,
     anim: Option<(Pos, f64)>,
+    clickable: bool,
 ) -> Option<Pos> {
     let board_size = BOARD_PIXEL_SIZE
         .min(ui.available_width())
         .min(ui.available_height());
     let total_size = board_size + LABEL_GUTTER * 2.0;
-    let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(total_size, total_size), egui::Sense::click());
+    let sense = if clickable {
+        egui::Sense::click()
+    } else {
+        egui::Sense::hover()
+    };
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(total_size, total_size), sense);
     let painter = ui.painter_at(rect);
 
     let board_rect = egui::Rect::from_min_max(
@@ -290,7 +631,8 @@ fn draw_board(
         );
     }
 
-    if response.clicked()
+    if clickable
+        && response.clicked()
         && !vm.game_over
         && let Some(pointer_pos) = response.interact_pointer_pos()
     {
