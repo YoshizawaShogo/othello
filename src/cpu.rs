@@ -1,10 +1,13 @@
 use rand::prelude::IndexedRandom;
 use reqwest::blocking::Client;
 use serde_json::{Value, json};
+use std::time::Duration;
 
 use crate::model::{BOARD_SIZE, Cell, Pos};
 
 const OPENAI_RESPONSES_URL: &str = "https://api.openai.com/v1/responses";
+const REQUEST_TIMEOUT_SECS: u64 = 90;
+const RETRY_ATTEMPTS: usize = 3;
 
 // Approximate USD per 1M tokens for gpt-5-mini; adjust as pricing changes.
 const INPUT_USD_PER_1M: f64 = 0.25;
@@ -65,10 +68,16 @@ pub struct OpenAiClient {
     http: Client,
 }
 
+#[derive(Clone, Copy)]
+struct RequestOptions {
+    include_temperature: bool,
+    include_reasoning: bool,
+}
+
 impl OpenAiClient {
     pub fn new(api_key: String, model: String) -> Result<Self, String> {
         let http = Client::builder()
-            .timeout(std::time::Duration::from_secs(20))
+            .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
             .build()
             .map_err(|e| format!("Failed to build HTTP client: {e}"))?;
         Ok(Self {
@@ -122,11 +131,65 @@ impl OpenAiClient {
         legal_moves: &[Pos],
         difficulty: Difficulty,
     ) -> Result<(Pos, Option<TokenUsage>), String> {
-        match self.call_openai_once(board, turn, legal_moves, difficulty, true) {
+        let primary = RequestOptions {
+            include_temperature: true,
+            include_reasoning: true,
+        };
+        match self.call_openai_once(board, turn, legal_moves, difficulty, primary) {
             Ok(ok) => Ok(ok),
             Err(err) => {
                 if is_unsupported_temperature_error(&err) {
-                    self.call_openai_once(board, turn, legal_moves, difficulty, false)
+                    let second = self.call_openai_once(
+                        board,
+                        turn,
+                        legal_moves,
+                        difficulty,
+                        RequestOptions {
+                            include_temperature: false,
+                            include_reasoning: true,
+                        },
+                    );
+                    match second {
+                        Ok(ok) => Ok(ok),
+                        Err(err2) if is_incomplete_max_output_tokens_error(&err2) => self
+                            .call_openai_once(
+                                board,
+                                turn,
+                                legal_moves,
+                                difficulty,
+                                RequestOptions {
+                                    include_temperature: false,
+                                    include_reasoning: false,
+                                },
+                            ),
+                        Err(err2) => Err(err2),
+                    }
+                } else if is_incomplete_max_output_tokens_error(&err) {
+                    let second = self.call_openai_once(
+                        board,
+                        turn,
+                        legal_moves,
+                        difficulty,
+                        RequestOptions {
+                            include_temperature: true,
+                            include_reasoning: false,
+                        },
+                    );
+                    match second {
+                        Ok(ok) => Ok(ok),
+                        Err(err2) if is_unsupported_temperature_error(&err2) => self
+                            .call_openai_once(
+                                board,
+                                turn,
+                                legal_moves,
+                                difficulty,
+                                RequestOptions {
+                                    include_temperature: false,
+                                    include_reasoning: false,
+                                },
+                            ),
+                        Err(err2) => Err(err2),
+                    }
                 } else {
                     Err(err)
                 }
@@ -140,7 +203,7 @@ impl OpenAiClient {
         turn: Cell,
         legal_moves: &[Pos],
         difficulty: Difficulty,
-        include_temperature: bool,
+        options: RequestOptions,
     ) -> Result<(Pos, Option<TokenUsage>), String> {
         let board_text = board_to_ascii(board);
         let legal = legal_moves
@@ -177,23 +240,16 @@ impl OpenAiClient {
                 }
             ]
         });
-        if include_temperature {
+        if options.include_temperature {
             payload["temperature"] = json!(difficulty.temperature());
         }
+        if !options.include_reasoning
+            && let Some(obj) = payload.as_object_mut()
+        {
+            obj.remove("reasoning");
+        }
 
-        let resp = self
-            .http
-            .post(OPENAI_RESPONSES_URL)
-            .bearer_auth(&self.api_key)
-            .header("Content-Type", "application/json")
-            .json(&payload)
-            .send()
-            .map_err(|e| format!("Request failed: {e}"))?;
-
-        let status = resp.status();
-        let body: Value = resp
-            .json()
-            .map_err(|e| format!("Failed to parse JSON response: {e}"))?;
+        let (status, body) = self.request_json_with_retry(&payload)?;
 
         if !status.is_success() {
             let msg = body
@@ -228,6 +284,106 @@ impl OpenAiClient {
 fn is_unsupported_temperature_error(err: &str) -> bool {
     let lower = err.to_ascii_lowercase();
     lower.contains("unsupported parameter") && lower.contains("temperature")
+}
+
+fn is_incomplete_max_output_tokens_error(err: &str) -> bool {
+    err.contains("incomplete_reason=max_output_tokens")
+}
+
+fn format_reqwest_error(err: &reqwest::Error) -> String {
+    let mut tags = Vec::new();
+    if err.is_timeout() {
+        tags.push("timeout");
+    }
+    if err.is_connect() {
+        tags.push("connect");
+    }
+    if err.is_request() {
+        tags.push("request");
+    }
+    if err.is_decode() {
+        tags.push("decode");
+    }
+    if err.is_status() {
+        tags.push("status");
+    }
+    let tag = if tags.is_empty() {
+        "unknown".to_string()
+    } else {
+        tags.join("|")
+    };
+    match err.url() {
+        Some(url) => format!("{tag}: {err} (url={url})"),
+        None => format!("{tag}: {err}"),
+    }
+}
+
+fn preview_body(raw: &str, max: usize) -> String {
+    let mut s = raw.replace('\n', "\\n");
+    if s.len() > max {
+        s.truncate(max);
+        s.push_str("...");
+    }
+    s
+}
+
+impl OpenAiClient {
+    fn request_json_with_retry(
+        &self,
+        payload: &Value,
+    ) -> Result<(reqwest::StatusCode, Value), String> {
+        let attempts = RETRY_ATTEMPTS;
+        let mut last_err = String::new();
+
+        for attempt in 1..=attempts {
+            let resp = self
+                .http
+                .post(OPENAI_RESPONSES_URL)
+                .bearer_auth(&self.api_key)
+                .header("Content-Type", "application/json")
+                .json(payload)
+                .send();
+
+            let resp = match resp {
+                Ok(r) => r,
+                Err(err) => {
+                    last_err = format!(
+                        "Request failed on attempt {attempt}/{attempts}: {} (timeout={}s)",
+                        format_reqwest_error(&err),
+                        REQUEST_TIMEOUT_SECS
+                    );
+                    if attempt < attempts {
+                        let backoff_ms = 400 * attempt as u64;
+                        std::thread::sleep(Duration::from_millis(backoff_ms));
+                        continue;
+                    }
+                    return Err(last_err);
+                }
+            };
+
+            let status = resp.status();
+            let raw = resp.text().map_err(|e| {
+                format!(
+                    "Failed to read response body (status {status}) on attempt {attempt}/{attempts}: {}",
+                    format_reqwest_error(&e)
+                )
+            })?;
+
+            let body: Value = match serde_json::from_str(&raw) {
+                Ok(v) => v,
+                Err(e) => {
+                    let preview = preview_body(&raw, 600);
+                    return Err(format!(
+                        "Failed to parse JSON response (status {status}) on attempt {attempt}/{attempts}: {e}; body_preview={preview}"
+                    ));
+                }
+            };
+
+            return Ok((status, body));
+        }
+
+        Err(last_err)
+    }
 }
 
 pub fn parse_move(raw: &str) -> Option<Pos> {
